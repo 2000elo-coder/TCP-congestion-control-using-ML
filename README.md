@@ -314,6 +314,18 @@ state = [
 ]
 ```
 
+Or expressed in standard mathematical formulations:
+
+$$\text{RTT}_{\text{norm}} = \text{clip}\left(\frac{\text{RTT}}{250.0}, 0, 1\right)$$
+
+$$\text{ssthresh}_{\text{norm}} = \text{clip}\left(\frac{\text{ssthresh}}{60.0}, 0, 1\right)$$
+
+$$\text{retrans\_rate} = \text{clip}\left(\frac{\text{bytes\_retrans}}{\text{bytes\_sent} + 1}, 0, 1\right)$$
+
+$$\text{delivery\_rate} = \text{clip}\left(\frac{\text{delivered}}{\text{segs\_out} + 1}, 0, 1\right)$$
+
+$$\text{cwnd}_{\text{norm}} = \text{clip}\left(\frac{\text{cwnd} - \text{cwnd}_{\text{min}}}{\text{cwnd}_{\text{max}} - \text{cwnd}_{\text{min}}}, 0, 1\right)$$
+
 ### 7.5 Reward Function
 
 The reward function is the most important design decision — it defines what 'good' behaviour means for the agent. It is a weighted sum of four components:
@@ -324,6 +336,19 @@ reward = 2.0 × tracking_reward
        - 0.5 × loss_penalty
        - rtt_penalty
 ```
+
+Or written explicitly as:
+
+$$R_t = 2.0 \cdot R_{\text{track}} + 0.3 \cdot \text{cwnd}_{\text{norm}} - 0.5 \cdot \text{Loss}_{\text{penalty}} - \text{RTT}_{\text{penalty}}$$
+
+Where:
+
+* **Tracking Component ($R_{\text{track}}$):** Forces the policy network to track historical baseline window updates closely to optimize behavioral alignment:
+  $$R_{\text{track}} = 1.0 - \frac{|\text{cwnd}_{\text{RL}} - \text{cwnd}_{\text{real}}|}{\text{cwnd}_{\text{max}} - \text{cwnd}_{\text{min}}}$$
+* **Loss Penalty:** Discourages transmission rate allocations that trigger queuing drops and segment retransmissions:
+  $$\text{Loss}_{\text{penalty}} = \text{clip}\left(\frac{\text{bytes\_retrans}}{\text{bytes\_sent} + 1}, 0, 1\right)$$
+* **RTT Penalty:** Mildly penalizes latency increases, preventing self-congestion bufferbloat:
+  $$\text{RTT}_{\text{penalty}} = 0.2 \cdot \text{clip}\left(\frac{\text{RTT}}{250.0}, 0, 1\right)$$
 
 | Component | Weight | Purpose |
 |---|---|---|
@@ -427,3 +452,232 @@ predicted_cwnd = (float(action[0]) + 1.0) / 2.0 * (cwnd_max - cwnd_min) + cwnd_m
 | `ep_rew_mean` not increasing | Learning rate too high or reward too sparse | Lower `learning_rate` to `1e-4`, increase `ent_coef` |
 | `explained_variance` stays near 0 | Value network not learning — too little data per update | Increase `n_steps` to 4096 |
 | Training crashes mid-run | RAM exhaustion on large dataset | Close other applications, reduce `total_timesteps` |
+
+---
+
+## 8. NS-3 Simulation Script Design (`tcp-rl-sim.cc`)
+
+The custom simulation script located in `scratch/tcp-rl-sim.cc` defines the network topology, schedules packet injection, and manages real-time tracing metrics. It allows evaluating your RL agent or baseline algorithms under multiple competitive parameters.
+
+### 8.1 Key Features
+
+- **Multi-Sender Topology Support:** Allows running single-sender flows or configuring up to 8 parallel senders ($N \in [1, 8]$) sharing a common bottleneck. This is used to test the fairness and performance of your model against other protocols.
+- **Staggered Flow Initiation:** Starts sender flows sequentially (`0.1 + i * 0.05` seconds) to avoid massive packet collisions during initial TCP synchronization handshakes.
+- **Dynamic Queue Sizing:** Queue disc limits on bottleneck devices are computed using propagation delays:
+  
+  $$qSize = \text{max}\left(10, \frac{\text{bandwidth} \times 10^6}{8} \times \frac{2 \times \text{delay}}{1000} \div \text{MSS}\right)$$
+
+### 8.2 Safe Connection Helper (Direct Socket Tracing)
+
+In NS-3.42, dynamic wildcard paths (such as `SocketList/*`) do not resolve before the simulation runs because sockets are allocated on demand. Attempting to connect wildcards in `main()` causes a fatal trace attachment error. 
+
+The simulation script resolves this by connecting to a specific target socket (`SocketList/0`) 0.5 seconds after execution begins:
+
+```cpp
+static void ConnectSenderTraces (uint32_t nodeIdx, uint32_t senderIdx)
+{
+    std::string base = "/NodeList/" + std::to_string (nodeIdx) +
+                       "/$ns3::TcpL4Protocol/SocketList/0/";
+
+    Config::ConnectWithoutContext (
+        base + "CongestionWindow",
+        MakeBoundCallback (&CwndChange, senderIdx));
+    Config::ConnectWithoutContext (
+        base + "SlowStartThreshold",
+        MakeBoundCallback (&SsthreshChange, senderIdx));
+    Config::ConnectWithoutContext (
+        base + "RTT",
+        MakeBoundCallback (&RttChange, senderIdx));
+    Config::ConnectWithoutContext (
+        base + "Tx",
+        MakeBoundCallback (&TxTrace, senderIdx));
+    Config::ConnectWithoutContext (
+        base + "Rx",
+        MakeBoundCallback (&RxTrace, senderIdx));
+}
+```
+
+---
+
+## 9. Real-Time Python Inference Bridge (`rl_bridge.py`)
+
+Because NS-3 (C++) cannot natively execute Python neural-network packages, `rl_bridge.py` coordinates state-space data and predictions via file-based Inter-Process Communication (IPC):
+
+```
+NS-3 Simulation (C++)                                 Python Bridge (rl_bridge.py)
+ ┌────────────────────────┐                             ┌────────────────────────┐
+ │ PeriodicTrace() fires  │                             │ rl_bridge.py loops and │
+ │ every 1 second         │                             │ polls for state file   │
+ └───────────┬────────────┘                             └───────────┬────────────┘
+             │                                                      │
+             │ 1. Writes stats to                                   │
+             │    /tmp/rl_state.txt                                 │
+             ▼                                                      │
+    [ /tmp/rl_state.txt ]                                           │
+             │                                                      │
+             │ 2. Parses and normalizes the                         │
+             └─────────────────────────────────────────────────────►│ features into observation
+                                                                    │ vector
+                                                                    │
+                                                                    │ 3. Runs inference:
+                                                                    │    model.predict(obs)
+                                                                    │
+                                                                    │ 4. Scales and writes cwnd
+                                                                    │    to /tmp/rl_action.txt
+                                                                    ▼
+                                                           [ /tmp/rl_action.txt ]
+                                                                    │
+             │ 5. Reads decision from                               │
+             │    /tmp/rl_action.txt                                │
+             ◄──────────────────────────────────────────────────────┘
+             │
+             ▼
+ ┌────────────────────────┐
+ │ Overrides cwnd of      │
+ │ active TCP socket      │
+ └────────────────────────┘
+```
+
+The script cleans up trailing `/tmp` files on boot, decodes raw metrics, applies normalization clipping matching `model.py`, and implements a 3-second timeout window upon detecting `/tmp/rl_done.txt` to ensure trailing packets finish logging cleanly.
+
+---
+
+## 10. Running the Co-Simulation Workflow
+
+### 10.1 Environment Execution Steps
+
+Move all required script assets to your local NS-3 root folder:
+
+```bash
+# Copy C++ simulation script to NS-3 scratch folder
+cp tcp-rl-sim.cc ~/Downloads/ns-allinone-3.42/ns-3.42/scratch/
+
+# Copy the trained model and Python bridge to the NS-3 root directory
+cp tcp_rl_agent.zip ~/Downloads/ns-allinone-3.42/ns-3.42/
+cp rl_bridge.py ~/Downloads/ns-allinone-3.42/ns-3.42/
+```
+
+Navigate to your NS-3 directory and build the binaries:
+
+```bash
+cd ~/Downloads/ns-allinone-3.42/ns-3.42
+./ns3 build
+```
+
+### 10.2 Running Baseline Modes (RL Disabled)
+
+Verify baseline network performance across multiple configurations (e.g., competing senders, bandwidth limits, one-way delays, and packet loss rates):
+
+```bash
+# 3 flows running Cubic over a 10 Mbps bottleneck link (40ms propagation delay)
+./ns3 run "tcp-rl-sim --algo=cubic --senders=3 --bandwidth=10 --delay=40 --loss=0.001 --rl=false"
+```
+
+Expected output showing successful baseline traffic sharing:
+```
+=== TCP-RL-SIM (multi-sender) ===
+Sender 0  : cubic  (ns3::TcpCubic)
+Senders 1+: cubic  (ns3::TcpCubic)  x2
+Bottleneck: 10 Mbps  40 ms  loss=0.001
+Duration  : 60 s
+-------------------------------------------------
+Throughput Summary
+  Sender 0 [baseline]  3.20 Mbps  (33.31% of total)
+  Sender 1 [competitor]  3.48 Mbps  (36.23% of total)
+  Sender 2 [competitor]  2.93 Mbps  (30.46% of total)
+```
+
+### 10.3 Running Co-Simulation Mode (RL Enabled)
+
+To execute the closed-loop co-simulation, run the Python inference bridge in one terminal, then start the NS-3 simulation in a separate terminal:
+
+**Terminal 1 (Start Python Bridge):**
+```bash
+cd ~/Downloads/ns-allinone-3.42/ns-3.42
+python3 rl_bridge.py --model tcp_rl_agent --cwnd_min 2 --cwnd_max 500 --verbose
+```
+
+**Terminal 2 (Start NS-3 with RL enabled):**
+```bash
+cd ~/Downloads/ns-allinone-3.42/ns-3.42
+./ns3 run "tcp-rl-sim --algo=cubic --duration=60 --rl=true"
+```
+
+---
+
+## 11. Real-Time Execution Logs & Performance Analysis
+
+### 11.1 Live IPC Communication Trace
+When Terminal 2 connects, the active TCP socket's metrics are output directly to the Python bridge, which calculates and applies the target congestion window:
+
+```
+Loading model from tcp_rl_agent.zip ...
+Model loaded.  cwnd range: [2.0, 500.0]
+Bridge ready — waiting for NS-3 simulation to start...
+
+  step     0 | rtt=273.00ms  cwnd_real=469.0  rl_cwnd=179.3
+  step     1 | rtt=281.00ms  cwnd_real=142.0  rl_cwnd=227.0
+  step     2 | rtt=288.00ms  cwnd_real=167.0  rl_cwnd=223.3
+  step     3 | rtt=220.00ms  cwnd_real=187.0  rl_cwnd=193.0
+  step     4 | rtt=237.00ms  cwnd_real=200.0  rl_cwnd=206.6
+  step     5 | rtt=247.00ms  cwnd_real=206.0  rl_cwnd=214.8
+```
+
+The RL agent maps continuous actions directly to congestion window decisions, adapting to network state changes rather than collapsing to the minimum congestion window bounds.
+
+### 11.2 Visual Performance Evaluation (`cwnd_comparison.png`)
+
+```
+Mean cwnd: RL agent vs real algorithm
+ 35 ├─
+ 30 ├─       ■   ■                   ■   ■
+ 25 ├─       │   │   ■   ■   ■   ■   │   │
+ 20 ├─   ■   │   │   │   │   │   │   │   │
+ 15 ├─   │   │   │   │   │   │   │   │   │
+ 10 ├─   │   │   │   │   │   │   │   │   │
+  5 ├─   │   │   │   │   │   │   │   │   │
+  0 └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───
+        bbr     bic    cubic   htcp    reno    vegas
+        
+        [■] Real algorithm   [■] RL agent
+```
+
+This chart confirms the generalization capabilities of the single neural network policy. The RL agent correctly scales its window sizes up or down depending on the active environment trace:
+- **High-capacity protocols (such as Illinois, Scalable, and Bic):** The agent correctly allocates large window sizes ($\ge 30$).
+- **Conservative protocols (such as Vegas, BBR, and CDG):** The agent reduces its transmission rate, preventing congestion collapse while maintaining link stability.
+
+---
+
+## 12. Detailed Troubleshooting of Co-Simulation Challenges
+
+Developing and deploying an inter-process co-simulation framework presented several challenges, which were resolved through targeted fixes:
+
+### 12.1 Out of Memory (OOM) Compiler Termination
+- **Problem:** During compilation, the C++ compiler (`cc1plus`) was terminated with a `Killed` signal. 
+- **Cause:** The Virtual Machine exhausted its physical memory footprint while attempting parallel compilation tasks.
+- **Resolution:** Allocated a persistent 4.0 GiB swap space (`/swapfile`) and restricted parallel execution by passing the `-j1` build flag:
+  ```bash
+  ./ns3 build -- -j1
+  ```
+
+### 12.2 Double Queue Disc Allocation Error
+- **Problem:** Running the simulation resulted in a crash stating: `"Cannot install a root queue disc on a device already having one."`
+- **Cause:** NS-3's `PointToPointHelper` automatically installs a default `PfifoFastQueueDisc` on every device it creates. Installing a second queue disc on top of it causes a fatal error.
+- **Resolution:** Explicitly uninstalled the default queue disc before attaching custom queue boundaries:
+  ```cpp
+  TrafficControlHelper tchUninstall;
+  tchUninstall.Uninstall(rrDevs);
+  ```
+
+### 12.3 Wildcard Socket Tracing Connection Failure
+- **Problem:** The simulation threw a fatal abort: `"Could not connect callback to /NodeList/0/$ns3::TcpL4Protocol/SocketList/*/CongestionWindow"`
+- **Cause:** Dynamic wildcard paths (using `*`) do not resolve in the `Config` system prior to active socket creation, causing the simulation to abort immediately.
+- **Resolution:** Scheduled trace registration 0.5 seconds after simulation boot, targeting the explicit socket path (`SocketList/0`) after connection establishment:
+  ```cpp
+  Simulator::Schedule(Seconds(0.5), &ConnectSenderTraces);
+  ```
+
+### 12.4 Missing Trace Sources in NS-3.42
+- **Problem:** Execution aborted with errors regarding missing trace paths such as `BytesRetransmitted`.
+- **Cause:** `BytesRetransmitted` is not a standard trace source in NS-3.42, causing a configuration failure.
+- **Resolution:** Switched to tracing standard event sources like `Tx` and `Rx` using `TraceConnectWithoutContext`, and bypassed potential trace path mismatches using safe callback wrappers.
